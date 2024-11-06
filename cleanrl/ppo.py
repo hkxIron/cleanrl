@@ -57,7 +57,7 @@ class Args:
     num_steps: int = 128
     """the number of steps to run in each environment per policy rollout"""
 
-    anneal_lr: bool = True
+    anneal_lr: bool = True # 传入 no-anneal_lr 来设置为False
     """Toggle learning rate annealing for policy and value networks"""
 
     gamma: float = 0.99
@@ -210,10 +210,10 @@ if __name__ == "__main__":
 
     for iteration in range(1, args.num_iterations + 1):
         # Annealing the rate if instructed to do so.
-        if args.anneal_lr:
+        if args.anneal_lr: # 默认均为退火lr
             frac = 1.0 - (iteration - 1.0) / args.num_iterations
-            lrnow = frac * args.learning_rate
-            optimizer.param_groups[0]["lr"] = lrnow
+            lr_now = frac * args.learning_rate
+            optimizer.param_groups[0]["lr"] = lr_now
 
         for step in range(0, args.num_steps):
             global_step += args.num_envs
@@ -224,6 +224,7 @@ if __name__ == "__main__":
             with torch.no_grad():
                 action, logprob, _, value = agent.get_action_and_value(next_obs)
                 values[step] = value.flatten()
+
             actions[step] = action
             logprobs[step] = logprob
 
