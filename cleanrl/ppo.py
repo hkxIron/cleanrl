@@ -118,7 +118,7 @@ def make_env(env_id, idx, capture_video, run_name):
 
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
-    torch.nn.init.orthogonal_(layer.weight, std)
+    torch.nn.init.orthogonal_(layer.weight, std) # 使用正定矩阵初始化
     torch.nn.init.constant_(layer.bias, bias_const)
     return layer
 
@@ -141,15 +141,34 @@ class Agent(nn.Module):
             layer_init(nn.Linear(64, envs.single_action_space.n), std=0.01),
         )
 
-    def get_value(self, x):
-        return self.critic(x)
+    def get_value(self, observation:torch.Tensor):
+        """
+        计算当前状态的值分数
 
-    def get_action_and_value(self, x, action=None):
-        logits = self.actor(x)
+        observation: [num_envs, action_num]
+        critic_value: [num_envs, 1]
+        """
+        return self.critic(observation)
+
+    def get_action_and_value(self, observation:torch.Tensor, action=None):
+        """
+        采样一个action并且计算当前状态的值分数
+        observation: [num_envs, action_num]
+        """
+        # observation: [num_envs, action_num]
+        # logits:[num_envs, observation_space_num]
+        logits = self.actor(observation)
         probs = Categorical(logits=logits)
-        if action is None:
+        if action is None: # action不存在，且采样一个新action
             action = probs.sample()
-        return action, probs.log_prob(action), probs.entropy(), self.critic(x)
+
+        # action:[num_envs, ]
+        # log_prob:[num_envs, ]
+        # entropy:[num_envs, ]
+        # critic_value:[num_envs, 1]
+        entropy = probs.entropy() # 计算probs的熵，即p*log(p),即我们希望p的分布越出现两端尖峰越好，而不是均匀分布, 即熵越大越好
+        critic_value = self.critic(observation)
+        return action, probs.log_prob(action), entropy, critic_value
 
 
 if __name__ == "__main__":
@@ -184,7 +203,7 @@ if __name__ == "__main__":
 
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
-    # env setup
+    # env setup, 有多个agent env同时进行实验
     envs = gym.vector.SyncVectorEnv(
         [make_env(args.env_id, i, args.capture_video, run_name) for i in range(args.num_envs)],
     )
@@ -194,26 +213,26 @@ if __name__ == "__main__":
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
 
     # ALGO Logic: Storage setup
-    obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
-    actions = torch.zeros((args.num_steps, args.num_envs) + envs.single_action_space.shape).to(device)
-    logprobs = torch.zeros((args.num_steps, args.num_envs)).to(device)
-    rewards = torch.zeros((args.num_steps, args.num_envs)).to(device)
-    dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
-    values = torch.zeros((args.num_steps, args.num_envs)).to(device)
+    obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device) #  [num_steps, num_envs, observation_space_num]
+    actions = torch.zeros((args.num_steps, args.num_envs) + envs.single_action_space.shape).to(device) #   [num_steps, num_envs, single_action_space_num]
+    logprobs = torch.zeros((args.num_steps, args.num_envs)).to(device) #  [num_steps, num_envs]
+    rewards = torch.zeros((args.num_steps, args.num_envs)).to(device) # [num_steps, num_envs]
+    dones = torch.zeros((args.num_steps, args.num_envs)).to(device) # [num_steps, num_envs]
+    critic_values = torch.zeros((args.num_steps, args.num_envs)).to(device) # [num_steps, num_envs]
 
     # TRY NOT TO MODIFY: start the game
-    global_step = 0
+    global_step = 0 # 所有环境的step相加
     start_time = time.time()
-    next_obs, _ = envs.reset(seed=args.seed)
-    next_obs = torch.Tensor(next_obs).to(device)
-    next_done = torch.zeros(args.num_envs).to(device)
+    next_obs, _ = envs.reset(seed=args.seed) # [num_envs, observation_space_num]
+    next_obs = torch.Tensor(next_obs).to(device) # [num_envs, observation_space_num]
+    next_done = torch.zeros(args.num_envs).to(device) # [num_envs, ]
 
     for iteration in range(1, args.num_iterations + 1):
         # Annealing the rate if instructed to do so.
         if args.anneal_lr: # 默认均为退火lr
             frac = 1.0 - (iteration - 1.0) / args.num_iterations
-            lr_now = frac * args.learning_rate
-            optimizer.param_groups[0]["lr"] = lr_now
+            lr_now = frac * args.learning_rate # lr随iter衰减，直至0
+            optimizer.param_groups[0]["lr"] = lr_now # 不同的group可以用不同的lr
 
         for step in range(0, args.num_steps):
             global_step += args.num_envs
@@ -222,11 +241,18 @@ if __name__ == "__main__":
 
             # ALGO LOGIC: action logic
             with torch.no_grad():
-                action, logprob, _, value = agent.get_action_and_value(next_obs)
-                values[step] = value.flatten()
+                # next_obs: [num_envs, observation_space_num]
+                # action:[num_envs, ]
+                # log_prob:[num_envs, ]
+                # entropy:[num_envs, ]
+                # critic_value:[num_envs, 1]
+                action, log_prob, _, value = agent.get_action_and_value(next_obs)
+                critic_values[step] = value.flatten()
 
+            # actions:[num_steps, num_envs, single_action_space_num]
+            # log_probs: [num_steps, num_envs]
             actions[step] = action
-            logprobs[step] = logprob
+            logprobs[step] = log_prob
 
             # TRY NOT TO MODIFY: execute the game and log data.
             next_obs, reward, terminations, truncations, infos = envs.step(action.cpu().numpy())
@@ -243,83 +269,111 @@ if __name__ == "__main__":
 
         # bootstrap value if not done
         with torch.no_grad():
+            # next_obs: [num_envs, observation_space_num]
+            # next_value: [num_envs, 1] -> [num_envs, ]
             next_value = agent.get_value(next_obs).reshape(1, -1)
+            # advantages: [num_steps, num_envs]
             advantages = torch.zeros_like(rewards).to(device)
-            lastgaelam = 0
+            """
+            Compute generalized advantage estimate. 
+            
+            delta(t) = R(t) + gamma * V(t+1) - V(t)
+            A(t) = delta(t) + gamma * lambda * A(t+1)
+            """
+            last_gae_lam = 0
             for t in reversed(range(args.num_steps)):
                 if t == args.num_steps - 1:
                     nextnonterminal = 1.0 - next_done
                     nextvalues = next_value
                 else:
                     nextnonterminal = 1.0 - dones[t + 1]
-                    nextvalues = values[t + 1]
-                delta = rewards[t] + args.gamma * nextvalues * nextnonterminal - values[t]
-                advantages[t] = lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
-            returns = advantages + values
+                    # values: [num_steps, num_envs]
+                    nextvalues = critic_values[t + 1]
+                # values: [num_steps, num_envs]
+                delta = rewards[t] + args.gamma * nextvalues * nextnonterminal - critic_values[t]
+                # advantages: [num_steps, num_envs]
+                # values: [num_steps, num_envs]
+                last_gae_lam = delta + args.gamma * args.gae_lambda * nextnonterminal * last_gae_lam
+                advantages[t] = last_gae_lam
+            discount_rewards = advantages + critic_values
 
         # flatten the batch
-        b_obs = obs.reshape((-1,) + envs.single_observation_space.shape)
+        # b_obs: [num_steps*num_envs, observation_space_num]
+        b_obs = obs.reshape((-1,) + envs.single_observation_space.shape) # 两个维度concat
+        # b_logprobs: [num_steps*num_envs]
         b_logprobs = logprobs.reshape(-1)
+        # b_actions: [num_steps*num_envs, single_action_space_num]
         b_actions = actions.reshape((-1,) + envs.single_action_space.shape)
+        # b_advantages: [num_steps*num_envs]
         b_advantages = advantages.reshape(-1)
-        b_returns = returns.reshape(-1)
-        b_values = values.reshape(-1)
+        # b_discount_rewards: [num_steps*num_envs]
+        b_discount_rewards = discount_rewards.reshape(-1)
+        # b_critic_values: [num_steps*num_envs]
+        b_critic_values = critic_values.reshape(-1)
 
         # Optimizing the policy and value network
-        b_inds = np.arange(args.batch_size)
+        b_index = np.arange(args.batch_size)
         clipfracs = []
-        for epoch in range(args.update_epochs):
-            np.random.shuffle(b_inds)
-            for start in range(0, args.batch_size, args.minibatch_size):
-                end = start + args.minibatch_size
-                mb_inds = b_inds[start:end]
+        for epoch in range(args.update_epochs): # 进行n次模型更新
+            np.random.shuffle(b_index) # 每次采样部分数据
+            for start in range(0, args.batch_size, args.minibatch_size): # minibatch_size:128
+                end = start + args.minibatch_size #
+                mb_inds = b_index[start:end]
 
-                _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_actions.long()[mb_inds])
-                logratio = newlogprob - b_logprobs[mb_inds]
-                ratio = logratio.exp()
+                # 利用更新后的模型重新计算(observation,state)对应的action_prob, critic_value值
+                _, new_log_prob, new_entropy, new_critic_value = agent.get_action_and_value(b_obs[mb_inds], b_actions.long()[mb_inds])
+                logratio = new_log_prob - b_logprobs[mb_inds] # log[ P(a|s)/P'(a|s) ]
+                # 重要性采样
+                ratio = logratio.exp() # ration = P(a|s)/P'(a|s)
 
                 with torch.no_grad():
                     # calculate approx_kl http://joschu.net/blog/kl-approx.html
                     old_approx_kl = (-logratio).mean()
-                    approx_kl = ((ratio - 1) - logratio).mean()
+                    approx_kl = ((ratio - 1) - logratio).mean() # 近似计算kl散度
                     clipfracs += [((ratio - 1.0).abs() > args.clip_coef).float().mean().item()]
 
                 mb_advantages = b_advantages[mb_inds]
-                if args.norm_adv:
+                if args.norm_adv: # 对advantage进行归一化
                     mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
 
                 # Policy loss
-                pg_loss1 = -mb_advantages * ratio
-                pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
-                pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+                pg_loss1 = mb_advantages * ratio
+                pg_loss2 = mb_advantages * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
+                pg_loss = - torch.min(pg_loss1, pg_loss2).mean()
 
                 # Value loss
-                newvalue = newvalue.view(-1)
+                new_critic_value = new_critic_value.view(-1)
                 if args.clip_vloss:
-                    v_loss_unclipped = (newvalue - b_returns[mb_inds]) ** 2
-                    v_clipped = b_values[mb_inds] + torch.clamp(
-                        newvalue - b_values[mb_inds],
+                    v_loss_unclipped = (new_critic_value - b_discount_rewards[mb_inds]) ** 2
+                    # ciritc_values不能差得太远,差得太远时就截断
+                    v_clipped = b_critic_values[mb_inds] + torch.clamp(new_critic_value - b_critic_values[mb_inds],
                         -args.clip_coef,
                         args.clip_coef,
                     )
-                    v_loss_clipped = (v_clipped - b_returns[mb_inds]) ** 2
+                    v_loss_clipped = (v_clipped - b_discount_rewards[mb_inds]) ** 2
                     v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped)
+                    # 计算mse loss
                     v_loss = 0.5 * v_loss_max.mean()
                 else:
-                    v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
+                    # 计算mse loss
+                    v_loss = 0.5 * ((new_critic_value - b_discount_rewards[mb_inds]) ** 2).mean()
 
-                entropy_loss = entropy.mean()
+                # 负熵loss, 一般地没有此项
+                entropy_loss = new_entropy.mean()
+                # 注意，此处将actor net,critic net网络的loss相加，两个网络参数同时更新
                 loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
 
+                # 更新模型参数
                 optimizer.zero_grad()
                 loss.backward()
-                nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
+                nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm) # 进行梯度裁剪
                 optimizer.step()
 
             if args.target_kl is not None and approx_kl > args.target_kl:
                 break
 
-        y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
+        # 查看critic的预测的方差
+        y_pred, y_true = b_critic_values.cpu().numpy(), b_discount_rewards.cpu().numpy()
         var_y = np.var(y_true)
         explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
 
