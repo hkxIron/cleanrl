@@ -234,6 +234,7 @@ if __name__ == "__main__":
             lr_now = frac * args.learning_rate # lr随iter衰减，直至0
             optimizer.param_groups[0]["lr"] = lr_now # 不同的group可以用不同的lr
 
+        # 让agent与env交互，获取state, reward数据
         for step in range(0, args.num_steps):
             global_step += args.num_envs
             obs[step] = next_obs
@@ -267,6 +268,7 @@ if __name__ == "__main__":
                         writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
                         writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
 
+        # 计算每局的discount reward
         # bootstrap value if not done
         with torch.no_grad():
             # next_obs: [num_envs, observation_space_num]
