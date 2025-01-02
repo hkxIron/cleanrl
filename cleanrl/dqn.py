@@ -146,6 +146,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
 
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
+    # 同时开启多个异步环境交互，大大提升收集env buffer的效率
     # env setup
     envs = gym.vector.SyncVectorEnv(
         [make_env(args.env_id, args.seed + i, i, args.capture_video, run_name) for i in range(args.num_envs)]
@@ -157,10 +158,11 @@ poetry run pip install "stable_baselines3==2.0.0a1"
     target_network = QNetwork(envs).to(device)
     target_network.load_state_dict(q_network.state_dict())
 
+    # ReplayBuffer居然已经是stable_baseline的一个类了
     rb = ReplayBuffer(
         args.buffer_size,
-        envs.single_observation_space,
-        envs.single_action_space,
+        envs.single_observation_space, # 状态维度
+        envs.single_action_space, # 动作维度
         device,
         handle_timeout_termination=False,
     )
@@ -171,12 +173,16 @@ poetry run pip install "stable_baselines3==2.0.0a1"
     for global_step in range(args.total_timesteps):
         # ALGO LOGIC: put action logic here
         epsilon = linear_schedule(args.start_e, args.end_e, args.exploration_fraction * args.total_timesteps, global_step)
+        # 以epsilon进行探索
         if random.random() < epsilon:
             actions = np.array([envs.single_action_space.sample() for _ in range(envs.num_envs)])
         else:
+            # 以1-epsilon进行利用, 得到Q(st, at)
             q_values = q_network(torch.Tensor(obs).to(device))
+            # 选取最大的action
             actions = torch.argmax(q_values, dim=1).cpu().numpy()
 
+        # 与环境交互，得到新状态以及rewards
         # TRY NOT TO MODIFY: execute the game and log data.
         next_obs, rewards, terminations, truncations, infos = envs.step(actions)
 
@@ -184,6 +190,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
         if "final_info" in infos:
             for info in infos["final_info"]:
                 if info and "episode" in info:
+                    # 一局结束了，需要记录它的终局的回报
                     print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
                     writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
                     writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
@@ -204,8 +211,11 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                 data = rb.sample(args.batch_size)
                 with torch.no_grad():
                     target_max, _ = target_network(data.next_observations).max(dim=1)
+                    # TD_target = R(t) + gamma* V(s(t+1))
                     td_target = data.rewards.flatten() + args.gamma * target_max * (1 - data.dones.flatten())
+                # 用Q(s(t),a)预测的值
                 old_val = q_network(data.observations).gather(1, data.actions).squeeze()
+                # 利用TD_target的值与Q(s(t), a)的值不一致更新Q(s(t),a)网络, 此时target_net没有更新
                 loss = F.mse_loss(td_target, old_val)
 
                 if global_step % 100 == 0:
@@ -221,13 +231,24 @@ poetry run pip install "stable_baselines3==2.0.0a1"
 
             # update target network
             if global_step % args.target_network_frequency == 0:
+                # 也可以用state_dict进行更新吧
+                """
+                # θ′ ← τ θ + (1 −τ )θ′
+                target_net_state_dict = target_net.state_dict()
+                policy_net_state_dict = policy_net.state_dict()
+                for key in policy_net_state_dict:
+                    # TAU: 0.005, 注意target_net使用policy_net的参数更新，但只以很小的步长在更新
+                    target_net_state_dict[key] = policy_net_state_dict[key]*TAU + target_net_state_dict[key]*(1-TAU)
+                target_net.load_state_dict(target_net_state_dict)
+                """
                 for target_network_param, q_network_param in zip(target_network.parameters(), q_network.parameters()):
-                    target_network_param.data.copy_(
+                    target_network_param.data.copy_( # 原地更新
                         args.tau * q_network_param.data + (1.0 - args.tau) * target_network_param.data
                     )
 
     if args.save_model:
         model_path = f"runs/{run_name}/{args.exp_name}.cleanrl_model"
+        # 保存的是q_network而不是target_network
         torch.save(q_network.state_dict(), model_path)
         print(f"model saved to {model_path}")
         from cleanrl_utils.evals.dqn_eval import evaluate
