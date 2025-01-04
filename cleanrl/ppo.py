@@ -23,6 +23,8 @@ Num Observation Min Max
 1 Cart Velocity -Inf  Inf
 2 Pole Angle  -0.418rad 0.418rad
 3 Pole Angular Velocity -Inf  Inf
+
+PPO是同策略，on-policy
 """
 
 @dataclass

@@ -14,7 +14,7 @@ import tyro
 from stable_baselines3.common.buffers import ReplayBuffer
 from torch.utils.tensorboard import SummaryWriter
 
-
+# DQN是异策略，off-policy
 @dataclass
 class Args:
     exp_name: str = os.path.basename(__file__)[: -len(".py")]
