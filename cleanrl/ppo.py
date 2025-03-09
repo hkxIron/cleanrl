@@ -165,7 +165,7 @@ class Agent(nn.Module):
         """
         return self.critic(observation)
 
-    def get_action_and_value(self, observation:torch.Tensor, action=None):
+    def get_policy_action_and_critic_value(self, observation:torch.Tensor, action=None):
         """
         采样一个action并且计算当前状态的值分数
         observation: [num_envs, action_num]
@@ -182,7 +182,7 @@ class Agent(nn.Module):
         # entropy:[num_envs, ]
         # critic_value:[num_envs, 1]
         entropy = probs.entropy() # 计算probs的熵，即-p*log(p),即我们希望p的分布越出现两端尖峰越好，而不是均匀分布
-        critic_value = self.critic(observation)
+        critic_value = self.critic(observation) # 此处actor, critic并不共享网络参数,都是各自的模型
         log_prob = probs.log_prob(action) # 注意：这里是取当前action的log_prob, 因此shape:[num_envs, ]
         return action, log_prob, entropy, critic_value
 
@@ -264,7 +264,7 @@ if __name__ == "__main__":
                 # log_prob:[num_envs, ], 当前动作的log_prob
                 # entropy:[num_envs, ]
                 # critic_value:[num_envs, 1]
-                action, log_prob, _, value = agent.get_action_and_value(next_obs)
+                action, log_prob, _, value = agent.get_policy_action_and_critic_value(next_obs)
                 critic_values[step] = value.flatten()
 
             # actions:[num_steps, num_envs, single_action_space_num]
@@ -348,7 +348,7 @@ if __name__ == "__main__":
                 mb_inds = b_index[start:end]
 
                 # 利用更新后的模型重新计算(observation,state)对应的action_prob, critic_value值
-                _, new_log_prob, new_entropy, new_critic_value = agent.get_action_and_value(b_obs[mb_inds], b_actions.long()[mb_inds])
+                _, new_log_prob, new_entropy, new_critic_value = agent.get_policy_action_and_critic_value(b_obs[mb_inds], b_actions.long()[mb_inds])
                 # 重要性采样
                 logratio = new_log_prob - b_logprobs[mb_inds] # log[ P(a|s)/P'(a|s) ]
                 ratio = logratio.exp() # ratio = P(a|s)/P'(a|s)
