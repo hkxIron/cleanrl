@@ -158,7 +158,7 @@ class Agent(nn.Module):
 
     def get_value(self, observation:torch.Tensor):
         """
-        计算当前状态的值分数
+        计算当前状态的值分数, 即critic value
 
         observation: [num_envs, action_num]
         critic_value: [num_envs, 1]
@@ -251,20 +251,21 @@ if __name__ == "__main__":
             lr_now = frac * args.learning_rate # lr随iter衰减，直至0
             optimizer.param_groups[0]["lr"] = lr_now # 不同的group可以用不同的lr
 
-        # 让agent与env交互num_steps次，获取state, reward数据
+        # 让agent与env交互num_steps次，获取state, reward数据, 一般为1局游戏的步数
         for step in range(0, args.num_steps):
+            current_obs = next_obs
             global_step += args.num_envs
-            obs[step] = next_obs
+            obs[step] = current_obs
             dones[step] = next_done
 
             # ALGO LOGIC: action logic
             with torch.no_grad():
-                # next_obs: [num_envs, observation_space_num]
+                # current_obs: [num_envs, observation_space_num]
                 # action:[num_envs, ]
                 # log_prob:[num_envs, ], 当前动作的log_prob
                 # entropy:[num_envs, ]
                 # critic_value:[num_envs, 1]
-                action, log_prob, _, value = agent.get_policy_action_and_critic_value(next_obs)
+                action, log_prob, _, value = agent.get_policy_action_and_critic_value(current_obs)
                 critic_values[step] = value.flatten()
 
             # actions:[num_steps, num_envs, single_action_space_num]
@@ -273,7 +274,7 @@ if __name__ == "__main__":
             logprobs[step] = log_prob
 
             # TRY NOT TO MODIFY: execute the game and log data.
-            # 注意：这里的instant reward来源于按当前策略采样而来的action与环境交互的instant_reward
+            # 注意：这里的reward来源于按当前策略采样而来的action与环境交互的instant_reward
             next_obs, reward, terminations, truncations, infos = envs.step(action.cpu().numpy())
             # 当前步如果人为中断或到达终点，则next_done=True
             next_done = np.logical_or(terminations, truncations)
@@ -292,8 +293,8 @@ if __name__ == "__main__":
         # bootstrap value if not done
         with torch.no_grad():
             # next_obs: [num_envs, observation_space_num]
-            # next_value: [num_envs, 1] -> [num_envs, ]
-            next_value = agent.get_value(next_obs).reshape(1, -1) # critic对下一状态的评分
+            # next_critic_value: [num_envs, 1] -> [num_envs, ]
+            next_critic_value = agent.get_value(next_obs).reshape(1, -1) # critic对下一状态的评分
             # advantages: [num_steps, num_envs]
             advantages = torch.zeros_like(rewards).to(device)
             """
@@ -301,13 +302,15 @@ if __name__ == "__main__":
             GAE: 在低方差与低偏置中取得平衡
             
             delta(t) = R(t) + gamma * V(t+1) - V(t), 这就是TD_ERROR
+            GAE就是对多个delta(t)按lambda指数加权平均
+            
             A(t) = delta(t) + gamma * lambda * A(t+1)
             """
             last_gae_lam = 0
             for t in reversed(range(args.num_steps)): # 按时间逆序计算
                 if t == args.num_steps - 1: # 最后时间步
                     nextnonterminal = 1.0 - next_done
-                    nextvalues = next_value
+                    nextvalues = next_critic_value
                 else: # 非最后时间步
                     nextnonterminal = 1.0 - dones[t + 1]
                     # values: [num_steps, num_envs]
@@ -320,7 +323,7 @@ if __name__ == "__main__":
                 # values: [num_steps, num_envs]
                 last_gae_lam = td_delta + args.gamma * args.gae_lambda * nextnonterminal * last_gae_lam # 此时last_gea_lam记当的还是next_gae_lam
                 advantages[t] = last_gae_lam
-            # A(s,a) = Q(s,a) - V(t) = R(t) + gamma*V(t+1) - V(t)
+            # GAE = advantages = A(s,a) = Q(s,a) - V(t) = R(t) + gamma*V(t+1) - V(t)
             # =>  Q(s,a) = A(s,a) + V(t), 其中Q(s, a)即为td target 的reward
             discount_rewards = advantages + critic_values
 
@@ -351,32 +354,34 @@ if __name__ == "__main__":
                 _, new_log_prob, new_entropy, new_critic_value = agent.get_policy_action_and_critic_value(b_obs[mb_inds], b_actions.long()[mb_inds])
                 # 重要性采样
                 logratio = new_log_prob - b_logprobs[mb_inds] # log[ P(a|s)/P'(a|s) ]
-                ratio = logratio.exp() # ratio = P(a|s)/P'(a|s)
+                importance_sampling_ratio = logratio.exp() # importance_sampling_ratio = P(a|s)/P'(a|s)
 
                 with torch.no_grad():
                     # calculate approx_kl http://joschu.net/blog/kl-approx.html
                     old_approx_kl = (-logratio).mean()
-                    approx_kl = ((ratio - 1) - logratio).mean() # 近似计算kl散度
-                    clipfracs += [((ratio - 1.0).abs() > args.clip_coef).float().mean().item()]
+                    """
+                    正向：KL(P||Q)=sum_{x}{p*log(p/q)}， p为真实label，q为模型, mode covering
+                    反向：KL(Q||P)=sum_{x}{q*log(q/p)}， p为真实label，q为模型, mode seeking
+                    """
+                    approx_kl = ((importance_sampling_ratio - 1) - logratio).mean() # 近似计算kl散度
+                    clipfracs += [((importance_sampling_ratio - 1.0).abs() > args.clip_coef).float().mean().item()]
 
                 mb_advantages = b_advantages[mb_inds]
                 if args.norm_adv: # 对advantage进行减均值除方差归一化
                     mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
 
                 # Policy loss
-                pg_loss1 = mb_advantages * ratio
-                pg_loss2 = mb_advantages * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
+                pg_loss1 = mb_advantages * importance_sampling_ratio
+                pg_loss2 = mb_advantages * torch.clamp(importance_sampling_ratio, 1 - args.clip_coef, 1 + args.clip_coef)
                 pg_loss = - torch.min(pg_loss1, pg_loss2).mean()
 
                 # Value loss
                 new_critic_value = new_critic_value.view(-1)
                 if args.clip_vloss:
+                    # b_discount_rewards: [num_steps*num_envs], b_discount_rewards = Q(s,a) = R(t) + gamma*V(t+1)
                     v_loss_unclipped = (new_critic_value - b_discount_rewards[mb_inds]) ** 2
                     # 新老ciritc_values不能差得太远,差得太远时就截断
-                    v_clipped = b_critic_values[mb_inds] + torch.clamp(new_critic_value - b_critic_values[mb_inds],
-                        -args.clip_coef,
-                        args.clip_coef,
-                    )
+                    v_clipped = b_critic_values[mb_inds] + torch.clamp(new_critic_value - b_critic_values[mb_inds], -args.clip_coef, args.clip_coef,)
                     v_loss_clipped = (v_clipped - b_discount_rewards[mb_inds]) ** 2
                     v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped)
                     # 计算mse loss
@@ -385,7 +390,7 @@ if __name__ == "__main__":
                     # 计算mse loss
                     v_loss = 0.5 * ((new_critic_value - b_discount_rewards[mb_inds]) ** 2).mean()
 
-                # 负熵loss, 一般地没有此项, 其为了使熵越大越好，即action的分布越接近越好？不太理解
+                # 负熵loss, 一般地没有此项, 其为了使熵越大越好，即action的分布多样性越大越好
                 entropy_loss = new_entropy.mean()
                 # 注意，此处将actor net,critic net网络的loss相加，两个网络参数同时更新
                 loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
